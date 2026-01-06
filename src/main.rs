@@ -3,6 +3,10 @@ use std::thread;
 use std::time::Duration;
 use rdev::{listen, Event, EventType, Key};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
+
+// Path to the Whisper model file
+const WHISPER_MODEL_PATH: &str = "models/ggml-base.en.bin";
 
 // Global state to track if we're currently recording
 static APP_STATE: Mutex<AppState> = Mutex::new(AppState::Idle);
@@ -12,6 +16,7 @@ lazy_static::lazy_static! {
     static ref AUDIO_BUFFER: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     static ref SAMPLE_RATE: Mutex<u32> = Mutex::new(48000);
     static ref CHANNELS: Mutex<u16> = Mutex::new(1);
+    static ref WHISPER_CTX: Mutex<Option<WhisperContext>> = Mutex::new(None);
 }
 
 // 1. Define our States
@@ -24,6 +29,23 @@ enum AppState {
 
 fn main() {
     println!("Lacon is running... (Press F1 to test)");
+
+    // Load Whisper model
+    println!("Loading Whisper model from {}...", WHISPER_MODEL_PATH);
+    match WhisperContext::new_with_params(
+        WHISPER_MODEL_PATH,
+        WhisperContextParameters::default(),
+    ) {
+        Ok(ctx) => {
+            *WHISPER_CTX.lock().unwrap() = Some(ctx);
+            println!("✓ Whisper model loaded successfully");
+        }
+        Err(e) => {
+            eprintln!("Failed to load Whisper model: {}", e);
+            eprintln!("Please download the model file first. See README.md for instructions.");
+            return;
+        }
+    }
 
     // Initialize audio device and config
     if let Err(e) = init_audio() {
@@ -225,14 +247,22 @@ fn stop_recording_and_save() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn process_audio_pipeline(wav_path: &str) {
-    // Step 1: Transcribe (Mock)
+    // Step 1: Transcribe
     println!("   -> 1. Transcribing Audio from {} (Whisper)...", wav_path);
-    let raw_text = "um hello world i am building lacon";
-    thread::sleep(Duration::from_millis(500)); // Fake delay
+    let raw_text = match transcribe_audio(wav_path) {
+        Ok(text) => {
+            println!("   -> Transcribed: \"{}\"", text);
+            text
+        }
+        Err(e) => {
+            eprintln!("   -> Transcription failed: {}", e);
+            return;
+        }
+    };
 
     // Step 2: Refine (Mock LLM Call)
     println!("   -> 2. Cleaning Text (Ollama)...");
-    let refined_text = call_ollama(raw_text);
+    let refined_text = call_ollama(&raw_text);
     
     // Step 3: Type (Mock)
     println!("   -> 3. Typing: '{}'", refined_text);
@@ -242,4 +272,98 @@ fn process_audio_pipeline(wav_path: &str) {
 fn call_ollama(_text: &str) -> String {
     // In the future, this will be a real HTTP request to localhost:11434
     format!("Hello world. I am building Lacon.")
+}
+
+fn prepare_audio_for_whisper(
+    audio_data: &[f32],
+    original_sample_rate: u32,
+    original_channels: u16,
+) -> Vec<f32> {
+    let target_sample_rate = 16000;
+    
+    // Step 1: Convert stereo to mono if needed
+    let mono_audio: Vec<f32> = if original_channels == 2 {
+        audio_data
+            .chunks_exact(2)
+            .map(|chunk| (chunk[0] + chunk[1]) / 2.0)
+            .collect()
+    } else {
+        audio_data.to_vec()
+    };
+    
+    // Step 2: Resample to 16kHz if needed
+    if original_sample_rate == target_sample_rate {
+        return mono_audio;
+    }
+    
+    // Simple linear interpolation resampling
+    let ratio = original_sample_rate as f32 / target_sample_rate as f32;
+    let new_length = (mono_audio.len() as f32 / ratio) as usize;
+    
+    let mut resampled = Vec::with_capacity(new_length);
+    for i in 0..new_length {
+        let src_index = i as f32 * ratio;
+        let src_index_floor = src_index.floor() as usize;
+        let src_index_ceil = (src_index_floor + 1).min(mono_audio.len() - 1);
+        let fraction = src_index - src_index_floor as f32;
+        
+        let sample = mono_audio[src_index_floor] * (1.0 - fraction)
+            + mono_audio[src_index_ceil] * fraction;
+        resampled.push(sample);
+    }
+    
+    resampled
+}
+
+fn transcribe_audio(wav_path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // Read the WAV file
+    let mut reader = hound::WavReader::open(wav_path)?;
+    let spec = reader.spec();
+    
+    // Read audio samples
+    let audio_data: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
+        hound::SampleFormat::Int => {
+            if spec.bits_per_sample == 16 {
+                reader
+                    .samples::<i16>()
+                    .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+                    .collect()
+            } else {
+                return Err("Unsupported bit depth".into());
+            }
+        }
+    };
+    
+    // Prepare audio for Whisper (16kHz mono)
+    let prepared_audio = prepare_audio_for_whisper(&audio_data, spec.sample_rate, spec.channels);
+    
+    // Get the Whisper context
+    let ctx_guard = WHISPER_CTX.lock().unwrap();
+    let ctx = ctx_guard
+        .as_ref()
+        .ok_or("Whisper context not initialized")?;
+    
+    // Create transcription parameters
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    
+    // Set language to English for better performance
+    params.set_language(Some("en"));
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    
+    // Create a state and run inference
+    let mut state = ctx.create_state()?;
+    state.full(params, &prepared_audio)?;
+    
+    // Collect all transcribed segments
+    let num_segments = state.full_n_segments()?;
+    let mut full_text = String::new();
+    
+    for i in 0..num_segments {
+        let segment = state.full_get_segment_text(i)?;
+        full_text.push_str(&segment);
+    }
+    
+    Ok(full_text.trim().to_string())
 }
