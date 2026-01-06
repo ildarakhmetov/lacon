@@ -22,3 +22,6 @@ enigo = "0.2"
 
 # Async Runtime
 tokio = { version = "1", features = ["full"] }
+
+# Utilities
+lazy_static = "1.5"
