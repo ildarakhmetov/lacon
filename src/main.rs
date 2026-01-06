@@ -4,6 +4,7 @@ use std::time::Duration;
 use rdev::{listen, Event, EventType, Key};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
+use enigo::{Enigo, Keyboard, Settings};
 
 // Path to the Whisper model file
 const WHISPER_MODEL_PATH: &str = "models/ggml-base.en.bin";
@@ -301,9 +302,19 @@ fn process_audio_pipeline(wav_path: &str) {
     println!("   -> 2. Cleaning Text (Ollama)...");
     let refined_text = call_ollama(&raw_text);
     
-    // Step 3: Type (Mock)
-    println!("   -> 3. Typing: '{}'", refined_text);
-    // TODO: enigo.key_sequence(&refined_text);
+    // Step 3: Type the refined text
+    println!("   -> 3. Typing into focused window...");
+    if let Err(e) = type_text(&refined_text) {
+        eprintln!("   -> Failed to type text: {}", e);
+    } else {
+        println!("   -> Typed: '{}'", refined_text);
+    }
+}
+
+fn type_text(text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut enigo = Enigo::new(&Settings::default())?;
+    enigo.text(text)?;
+    Ok(())
 }
 
 fn call_ollama(text: &str) -> String {
