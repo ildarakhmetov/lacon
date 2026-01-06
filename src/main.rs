@@ -8,6 +8,10 @@ use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingS
 // Path to the Whisper model file
 const WHISPER_MODEL_PATH: &str = "models/ggml-base.en.bin";
 
+// Ollama API Configuration
+const OLLAMA_MODEL: &str = "qwen2.5:3b-instruct";
+const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
+
 // Global state to track if we're currently recording
 static APP_STATE: Mutex<AppState> = Mutex::new(AppState::Idle);
 
@@ -25,6 +29,39 @@ enum AppState {
     Idle,
     Recording,
     Processing,
+}
+
+// Ollama API request/response structures
+#[derive(serde::Serialize)]
+struct OllamaRequest {
+    model: String,
+    prompt: String,
+    stream: bool,
+}
+
+// Response structure based on Ollama API docs: /api/generate (non-streaming)
+#[derive(serde::Deserialize, Debug)]
+struct OllamaResponse {
+    model: String,
+    created_at: String,
+    response: String,
+    done: bool,
+    #[serde(default)]
+    context: Option<Vec<i32>>,
+    #[serde(default)]
+    done_reason: Option<String>,
+    #[serde(default)]
+    total_duration: Option<i64>,
+    #[serde(default)]
+    load_duration: Option<i64>,
+    #[serde(default)]
+    prompt_eval_count: Option<i32>,
+    #[serde(default)]
+    prompt_eval_duration: Option<i64>,
+    #[serde(default)]
+    eval_count: Option<i32>,
+    #[serde(default)]
+    eval_duration: Option<i64>,
 }
 
 fn main() {
@@ -269,9 +306,55 @@ fn process_audio_pipeline(wav_path: &str) {
     // TODO: enigo.key_sequence(&refined_text);
 }
 
-fn call_ollama(_text: &str) -> String {
-    // In the future, this will be a real HTTP request to localhost:11434
-    format!("Hello world. I am building Lacon.")
+fn call_ollama(text: &str) -> String {
+    // Build the prompt with instructions
+    let prompt = format!(
+        "You are a text cleanup assistant. Your task is to clean up transcription errors, fix grammar and punctuation, and improve readability. Return ONLY the cleaned text without any explanations or additional commentary.\n\nTranscribed text: {}\n\nCleaned text:",
+        text
+    );
+    
+    // Create the request payload
+    let request = OllamaRequest {
+        model: OLLAMA_MODEL.to_string(),
+        prompt,
+        stream: false,
+    };
+    
+    // Make the HTTP POST request
+    match reqwest::blocking::Client::new()
+        .post(OLLAMA_URL)
+        .json(&request)
+        .send()
+    {
+        Ok(response) => {
+            let status = response.status();
+            if !status.is_success() {
+                eprintln!("   -> Ollama API returned status: {}", status);
+                let body = response.text().unwrap_or_else(|_| "Unable to read body".to_string());
+                eprintln!("   -> Response body: {}", body);
+                eprintln!("   -> Falling back to original text");
+                return text.to_string();
+            }
+            
+            match response.json::<OllamaResponse>() {
+                Ok(ollama_response) => {
+                    let cleaned = ollama_response.response.trim().to_string();
+                    println!("   -> Ollama refined: \"{}\"", cleaned);
+                    cleaned
+                }
+                Err(e) => {
+                    eprintln!("   -> Failed to parse Ollama response: {}", e);
+                    eprintln!("   -> Falling back to original text");
+                    text.to_string()
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("   -> Failed to call Ollama API: {}", e);
+            eprintln!("   -> Falling back to original text");
+            text.to_string()
+        }
+    }
 }
 
 fn prepare_audio_for_whisper(
